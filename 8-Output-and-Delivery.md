@@ -1,386 +1,462 @@
-# Part 7 — The Orchestrator
+# Part 8 — Output & Delivery
 
-## Building the End-to-End Automation Pipeline
+## PDF Export, Email Delivery, and Reliable Delivery Queues
 
-> **Goal:** Build the orchestration layer that coordinates the entire document generation workflow—from retrieving data to producing finished documents—using a modular, extensible pipeline.
+> **Goal:** Extend Greymatter Docs beyond document generation by exporting Writer documents to PDF, delivering them via email, and introducing a delivery queue that tracks the status of every generated document.
 
-**Milestone:** By the end of this chapter, Greymatter Docs will process document generation jobs through a centralized orchestrator, making it easy to automate individual or batch document creation.
+**Milestone:** By the end of this chapter, Greymatter Docs will automatically generate an `.odt` document, export it as a PDF, queue it for delivery, send it via SMTP, and update the delivery status.
 
 ---
 
 # THEORY & ARCHITECTURE
 
-Up to this point, `main.py` has been coordinating every step of the application:
+Generating a document is only half the workflow. Most business applications also need to deliver the final document.
 
-* Connecting to the database
-* Loading customer data
-* Connecting to LibreOffice
-* Opening templates
-* Replacing placeholders
-* Building tables
-* Saving documents
+Our output pipeline will:
 
-As the application grows, `main.py` will become difficult to maintain.
+1. Generate the document (`.odt`)
+2. Export it to PDF
+3. Create a delivery job
+4. Send the document by email
+5. Record the delivery result
 
-Instead, we'll introduce an **Orchestrator** that manages the workflow while delegating specific tasks to dedicated services.
-
-The updated architecture:
+Updated architecture:
 
 ```text
-                     main.py
-                        │
-                        ▼
-             DocumentOrchestrator
-                        │
-        ┌───────────────┼────────────────┐
-        ▼               ▼                ▼
- Repository Layer   Processor Layer   Service Layer
-        │               │                │
-        ▼               ▼                ▼
-     SQLite       Placeholder/Table     UNO API
-                        │
-                        ▼
-                 Generated Document
+                    SQLite
+                       │
+                       ▼
+              Document Orchestrator
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+    LibreOffice Writer        Delivery Queue
+          │                         │
+          ▼                         ▼
+      Export PDF              SMTP Service
+          │                         │
+          └────────────┬────────────┘
+                       ▼
+                 Customer Inbox
 ```
 
-The orchestrator acts as the application's **conductor**, coordinating each component without embedding business logic.
+This separation allows document generation and delivery to evolve independently.
 
 ---
 
 # BUILD IT
 
-## Step 1 — Update the Project Structure
+## Step 1 — Extend the Database
+
+Add a table to track document delivery.
+
+```sql
+CREATE TABLE IF NOT EXISTS delivery_queue (
+
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    invoice_id INTEGER NOT NULL,
+
+    customer_id INTEGER NOT NULL,
+
+    output_file TEXT NOT NULL,
+
+    pdf_file TEXT NOT NULL,
+
+    recipient_email TEXT NOT NULL,
+
+    status TEXT NOT NULL,
+
+    error_message TEXT,
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    sent_at TIMESTAMP
+);
+```
+
+### Status Values
+
+| Status  | Meaning                |
+| ------- | ---------------------- |
+| PENDING | Waiting for delivery   |
+| SENT    | Successfully delivered |
+| FAILED  | Delivery failed        |
+
+---
+
+## Step 2 — Create the PDF Export Service
+
+Project structure:
 
 ```text
-greymatter_docs/
+services/
 │
-├── config/
-├── database/
-├── exceptions/
-├── processor/
-├── services/
-├── orchestrator/
-│   ├── __init__.py
-│   ├── document_orchestrator.py
-│   └── job_context.py
-│
-├── templates/
-├── output/
-├── logs/
-└── main.py
+├── libreoffice_service.py
+├── writer_service.py
+├── pdf_service.py
+└── smtp_service.py
 ```
 
 ---
 
-## Step 2 — Create a Job Context
-
-A job context carries all information needed during a document generation job.
-
-**orchestrator/job_context.py**
-
-```python
-from dataclasses import dataclass
-from pathlib import Path
-
-
-@dataclass
-class JobContext:
-    """Represents a document generation job."""
-
-    customer_id: int
-    invoice_id: int
-    template_name: str
-    output_file: Path
-```
-
-This makes it easy to pass job information through the pipeline without long parameter lists.
-
----
-
-## Step 3 — Build the Document Orchestrator
-
-**orchestrator/document_orchestrator.py**
+### `services/pdf_service.py`
 
 ```python
 import logging
+from pathlib import Path
 
-from database.repositories import CustomerRepository
-from database.invoice_repository import InvoiceRepository
-from processor.document_processor import DocumentProcessor
-from processor.table_processor import TableProcessor
-from processor.template_loader import TemplateLoader
-from services.libreoffice_service import LibreOfficeService
-from services.writer_service import WriterService
+import uno
 
 logger = logging.getLogger(__name__)
 
 
-class DocumentOrchestrator:
-    """Coordinates the document generation workflow."""
+class PdfService:
+    """Exports Writer documents to PDF."""
+
+    @staticmethod
+    def export(document, output_file: Path):
+        """Export a Writer document as PDF."""
+
+        try:
+            pdf_path = output_file.with_suffix(".pdf")
+
+            properties = (
+                uno.createUnoStruct(
+                    "com.sun.star.beans.PropertyValue"
+                ),
+            )
+
+            properties[0].Name = "FilterName"
+            properties[0].Value = "writer_pdf_Export"
+
+            document.storeToURL(
+                uno.systemPathToFileUrl(
+                    str(pdf_path.resolve())
+                ),
+                properties,
+            )
+
+            logger.info(
+                "PDF exported: %s",
+                pdf_path
+            )
+
+            return pdf_path
+
+        except Exception as error:
+            logger.exception(error)
+
+            raise RuntimeError(
+                "Unable to export PDF."
+            ) from error
+```
+
+---
+
+## Step 3 — Configure SMTP Settings
+
+Update `config/settings.py`
+
+```python
+SMTP_SERVER = "smtp.example.com"
+SMTP_PORT = 587
+
+SMTP_USERNAME = "username"
+
+SMTP_PASSWORD = "password"
+
+SMTP_SENDER = "noreply@example.com"
+```
+
+> **Production Tip:** Never hardcode credentials. Use environment variables or a secrets manager.
+
+---
+
+## Step 4 — Build the SMTP Service
+
+**services/smtp_service.py**
+
+```python
+import logging
+import smtplib
+
+from email.message import EmailMessage
+
+from config.settings import (
+    SMTP_SERVER,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_SENDER,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class SmtpService:
+
+    def send_email(
+        self,
+        recipient,
+        subject,
+        body,
+        attachment
+    ):
+
+        try:
+
+            message = EmailMessage()
+
+            message["Subject"] = subject
+            message["From"] = SMTP_SENDER
+            message["To"] = recipient
+
+            message.set_content(body)
+
+            with open(
+                attachment,
+                "rb"
+            ) as file:
+
+                message.add_attachment(
+                    file.read(),
+                    maintype="application",
+                    subtype="pdf",
+                    filename=attachment.name,
+                )
+
+            with smtplib.SMTP(
+                SMTP_SERVER,
+                SMTP_PORT
+            ) as smtp:
+
+                smtp.starttls()
+
+                smtp.login(
+                    SMTP_USERNAME,
+                    SMTP_PASSWORD
+                )
+
+                smtp.send_message(message)
+
+            logger.info(
+                "Email delivered to %s",
+                recipient
+            )
+
+        except Exception as error:
+
+            logger.exception(error)
+
+            raise RuntimeError(
+                "Unable to send email."
+            ) from error
+```
+
+---
+
+## Step 5 — Create the Delivery Repository
+
+**database/delivery_repository.py**
+
+```python
+import logging
+
+from database.database import DatabaseManager
+
+logger = logging.getLogger(__name__)
+
+
+class DeliveryRepository:
 
     def __init__(self):
-        self.customer_repository = CustomerRepository()
-        self.invoice_repository = InvoiceRepository()
-        self.document_processor = DocumentProcessor()
-        self.table_processor = TableProcessor()
-        self.libreoffice = LibreOfficeService()
+        self.database = DatabaseManager()
 
-    def generate_document(self, job):
-        """Generate a document for a single job."""
+    def create_job(
+        self,
+        customer_id,
+        invoice_id,
+        output_file,
+        pdf_file,
+        recipient,
+    ):
 
-        logger.info("Starting job for invoice %s", job.invoice_id)
-
-        self.libreoffice.connect()
-
-        writer = WriterService(self.libreoffice.desktop)
-
-        customer = self.customer_repository.get_customer_by_id(
-            job.customer_id
+        sql = """
+        INSERT INTO delivery_queue
+        (
+            customer_id,
+            invoice_id,
+            output_file,
+            pdf_file,
+            recipient_email,
+            status
         )
+        VALUES (?, ?, ?, ?, ?, 'PENDING')
+        """
 
-        invoice = self.invoice_repository.get_invoice(
-            job.invoice_id
-        )
+        with self.database.get_connection() as connection:
 
-        items = self.invoice_repository.get_invoice_items(
-            job.invoice_id
-        )
+            cursor = connection.cursor()
 
-        values = {}
-
-        values.update(dict(customer))
-        values.update(dict(invoice))
-
-        template_path = TemplateLoader.get_template_path(
-            job.template_name
-        )
-
-        document = writer.open_document(template_path)
-
-        self.document_processor.replace_placeholders(
-            document,
-            values
-        )
-
-        tables = document.getTextTables()
-
-        if tables.getCount() > 0:
-            table = tables.getByIndex(0)
-
-            self.table_processor.populate_table(
-                table,
-                items
+            cursor.execute(
+                sql,
+                (
+                    customer_id,
+                    invoice_id,
+                    str(output_file),
+                    str(pdf_file),
+                    recipient,
+                ),
             )
 
-        writer.save_document(
-            document,
-            job.output_file
-        )
+            connection.commit()
 
-        writer.close_document(document)
-
-        logger.info("Job completed successfully.")
+            return cursor.lastrowid
 ```
 
 ---
 
-## Step 4 — Build a Job Queue
+## Step 6 — Update the Orchestrator
 
-Although we'll introduce full batch processing in Part 9, we can prepare by creating a simple queue.
-
-**main.py**
+After saving the Writer document:
 
 ```python
-from pathlib import Path
+pdf_service = PdfService()
 
-from config.logger import logger
-from config.settings import OUTPUT_DIR
-from orchestrator.document_orchestrator import (
-    DocumentOrchestrator,
+pdf_file = pdf_service.export(
+    document,
+    job.output_file
 )
-from orchestrator.job_context import JobContext
+```
 
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
+Create the delivery job.
+
+```python
+delivery_id = delivery_repository.create_job(
+    job.customer_id,
+    job.invoice_id,
+    job.output_file,
+    pdf_file,
+    customer["email"]
 )
-
-jobs = [
-    JobContext(
-        customer_id=1,
-        invoice_id=1,
-        template_name="invoice.ott",
-        output_file=OUTPUT_DIR / "invoice_001.odt",
-    ),
-    JobContext(
-        customer_id=2,
-        invoice_id=2,
-        template_name="invoice.ott",
-        output_file=OUTPUT_DIR / "invoice_002.odt",
-    ),
-]
 ```
 
----
-
-## Step 5 — Execute the Queue
+Then send the email.
 
 ```python
-def main():
-    logger.info("=" * 60)
-    logger.info("Greymatter Docs Starting")
-
-    orchestrator = DocumentOrchestrator()
-
-    for job in jobs:
-        try:
-            orchestrator.generate_document(job)
-        except Exception:
-            logger.exception(
-                "Job failed for invoice %s",
-                job.invoice_id
-            )
-
-
-if __name__ == "__main__":
-    main()
+smtp_service.send_email(
+    recipient=customer["email"],
+    subject="Your Invoice",
+    body="Please find your invoice attached.",
+    attachment=pdf_file,
+)
 ```
 
-Each job is processed independently. If one fails, the remaining jobs continue.
+Finally, update the delivery status to `SENT`.
 
----
-
-## Step 6 — Add Pipeline Hooks
-
-Add logging hooks inside `generate_document()`:
-
-```python
-logger.info("Loading customer...")
-logger.info("Loading invoice...")
-logger.info("Opening template...")
-logger.info("Replacing placeholders...")
-logger.info("Populating tables...")
-logger.info("Saving document...")
-```
-
-These checkpoints make it easy to trace execution in production logs.
+If an exception occurs, update the status to `FAILED` and record the error message.
 
 ---
 
 # CODE WALKTHROUGH
 
-## Why an Orchestrator?
+## PDF Export
 
-Without an orchestrator:
+LibreOffice supports many export formats through filters.
 
-* Business logic becomes scattered.
-* `main.py` grows uncontrollably.
-* Testing becomes more difficult.
-
-With an orchestrator:
-
-* Each service has one responsibility.
-* Workflow changes happen in one place.
-* The application becomes easier to extend.
-
----
-
-## The Job Context
-
-Instead of passing multiple arguments:
+For Writer documents:
 
 ```python
-generate_document(
-    customer_id,
-    invoice_id,
-    template_name,
-    output_path
-)
+writer_pdf_Export
 ```
 
-we pass a single object:
+Other examples include:
 
-```python
-generate_document(job)
-```
+| Filter              | Purpose |
+| ------------------- | ------- |
+| `writer_pdf_Export` | PDF     |
+| `writer8`           | ODT     |
+| `MS Word 2007 XML`  | DOCX    |
 
-This improves readability and makes future enhancements—such as priority levels or output formats—straightforward.
+This makes Greymatter Docs extensible without changing the processing pipeline.
 
 ---
 
-## Fault Isolation
+## Delivery Queue
 
-Notice that each job is wrapped in its own `try/except` block.
+Rather than sending emails immediately after document generation, we first create a delivery record.
 
-This ensures:
+Benefits:
 
-* One failed job does not stop the queue.
-* Every failure is logged.
-* Successful jobs continue processing.
-
-This is essential for batch document generation.
+* Failed deliveries can be retried.
+* Delivery history is preserved.
+* Administrators can monitor queue status.
+* Future enhancements can support asynchronous workers.
 
 ---
 
-## Pipeline Stages
+## SMTP Service
 
-Each document flows through the same sequence:
+The `SmtpService` has a single responsibility:
+
+* Build the email.
+* Attach the PDF.
+* Send it.
+
+Keeping email logic separate from the orchestrator simplifies testing and future integrations with services such as Microsoft 365, Gmail, or Amazon SES.
+
+---
+
+## Workflow
 
 ```text
-Receive Job
+Generate ODT
       │
       ▼
-Load Customer
+Export PDF
       │
       ▼
-Load Invoice
+Create Delivery Job
       │
       ▼
-Open Template
+Send Email
       │
       ▼
-Replace Placeholders
-      │
-      ▼
-Populate Tables
-      │
-      ▼
-Save Document
-      │
-      ▼
-Close Document
+Update Delivery Status
 ```
 
-This predictable pipeline makes debugging and maintenance much simpler.
+Each stage is independent, making it easier to recover from failures.
 
 ---
 
 # CHALLENGE LAB
 
-Extend the orchestrator with the following features:
+Enhance the output and delivery pipeline with the following tasks:
 
-1. Add a unique `job_id` to `JobContext`.
-2. Record the start and end time of each job.
-3. Log the total processing time for each document.
-4. Skip document generation if the output file already exists (unless an `overwrite` flag is set).
-5. Generate a summary report showing:
+1. Add support for multiple attachments.
+2. Send both the `.odt` and `.pdf` versions of the document.
+3. Implement a retry mechanism that attempts to resend failed emails up to three times.
+4. Add email templates with placeholders such as:
 
-   * Total jobs processed
-   * Successful jobs
-   * Failed jobs
-   * Total execution time
+```text
+{{first_name}}
+{{invoice_number}}
+```
+
+5. Record the delivery duration in the database.
 
 ---
 
 # TROUBLESHOOTING
 
-| Problem                                   | Cause                                 | Solution                                                              |
-| ----------------------------------------- | ------------------------------------- | --------------------------------------------------------------------- |
-| Pipeline stops after one failure          | Exceptions are not isolated           | Wrap each job in its own `try/except` block.                          |
-| Wrong customer data appears in a document | Incorrect job configuration           | Verify the `customer_id` and `invoice_id` values in the `JobContext`. |
-| Output file overwritten unintentionally   | No overwrite check                    | Verify whether the output file exists before saving.                  |
-| Logs are difficult to follow              | Insufficient pipeline logging         | Add clear log messages before and after each major processing step.   |
-| `AttributeError` on `JobContext`          | Missing or incorrect dataclass fields | Ensure the dataclass matches the required job attributes.             |
+| Problem                           | Cause                               | Solution                                                        |
+| --------------------------------- | ----------------------------------- | --------------------------------------------------------------- |
+| PDF export fails                  | Incorrect LibreOffice export filter | Use `writer_pdf_Export` for Writer documents.                   |
+| Email not delivered               | SMTP configuration is incorrect     | Verify server, port, credentials, and TLS settings.             |
+| Attachment missing                | Incorrect file path                 | Ensure the PDF exists before sending the email.                 |
+| Delivery status remains `PENDING` | Status update not executed          | Update the queue after successful or failed delivery.           |
+| SMTP authentication fails         | Invalid username or password        | Confirm credentials and avoid hardcoding secrets in production. |
 
 ---
 
@@ -388,12 +464,12 @@ Extend the orchestrator with the following features:
 
 In this chapter, you:
 
-* Introduced a dedicated orchestration layer.
-* Created a `JobContext` dataclass to encapsulate document generation requests.
-* Built a `DocumentOrchestrator` to coordinate repositories, processors, and services.
-* Executed multiple document generation jobs through a reusable pipeline.
-* Improved resilience by isolating failures and enhancing logging.
+* Exported Writer documents to PDF using the LibreOffice UNO API.
+* Built a dedicated `PdfService` for document conversion.
+* Implemented an `SmtpService` for email delivery with PDF attachments.
+* Introduced a `delivery_queue` table to track delivery jobs.
+* Updated the orchestrator to create delivery records, send emails, and record delivery outcomes.
 
-Greymatter Docs now has a scalable automation workflow capable of processing multiple document generation jobs in a consistent and maintainable manner.
+Greymatter Docs now supports a complete document delivery workflow, transforming generated documents into deliverable business assets.
 
-**Next:** **Part 8 – Output & Delivery**, where we'll extend the platform to export documents as PDF, deliver them via SMTP email, and introduce a simple delivery queue for reliable document distribution.
+**Next:** **Part 9 – Professional Polish**, where we'll add batch processing, progress reporting, performance optimizations, configuration profiles, and operational enhancements that prepare Greymatter Docs for high-volume document generation.
